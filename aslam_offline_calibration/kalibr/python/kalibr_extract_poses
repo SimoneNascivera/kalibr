@@ -1,0 +1,150 @@
+#!/usr/bin/env python
+print("importing libraries")
+import sm
+import kalibr_common as kc
+from kalibr_imu_camera_calibration import *
+
+import numpy as np
+import argparse
+import signal
+import sys
+import os
+
+# make numpy print prettier
+np.set_printoptions(suppress=True)
+
+def signal_exit(signal, frame):
+    print("")
+    sm.logWarn("Shutting down! (CTRL+C)")
+    sys.exit(1)
+
+#helper to constrain certain arguments to be specified only once
+class Once(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string = None):
+        if getattr(namespace, self.dest) is not None:
+            msg = '{o} can only be specified once'.format(o = option_string)
+            raise argparse.ArgumentError(None, msg)
+        setattr(namespace, self.dest, values)
+
+def parseArgs():
+    class KalibrArgParser(argparse.ArgumentParser):
+        def error(self, message):
+            self.print_help()
+            sm.logError('%s' % message)
+            sys.exit(2)
+        def format_help(self):
+            formatter = self._get_formatter()
+            formatter.add_text(self.description)
+            formatter.add_usage(self.usage, self._actions,
+                                self._mutually_exclusive_groups)
+            for action_group in self._action_groups:
+                formatter.start_section(action_group.title)
+                formatter.add_text(action_group.description)
+                formatter.add_arguments(action_group._group_actions)
+                formatter.end_section()
+            formatter.add_text(self.epilog)
+            return formatter.format_help()     
+        
+    usage = """
+    Example usage to get camera pose wrt to aprilgrid.
+    
+    %(prog)s --bag MYROSBAG.bag --cam camchain.yaml \\
+             --target aprilgrid.yaml 
+    
+    camchain.yaml: is the camera-system calibration output of the multiple-camera
+                   calibratin tool (kalibr_calibrate_cameras)
+    
+    example aprilgrid.yaml:       
+        target_type: 'aprilgrid'    
+        tagCols: 6                
+        tagRows: 6                
+        tagSize: 0.088            
+        tagSpacing: 0.3           """    
+
+    #setup the argument list
+    parser = KalibrArgParser(description='Calibrate the spatial and temporal parameters of an IMU to a camera chain.', usage=usage)
+    
+    #data source
+    groupData = parser.add_argument_group('Dataset source')
+    groupData.add_argument('--bag', dest='bagfile', nargs=1, help='Ros bag file containing image and imu data (rostopics specified in the yamls)', action=Once, required=True)
+    groupData.add_argument('--bag-from-to', metavar='bag_from_to', type=float, nargs=2, help='Use the bag data starting from up to this time [s]')
+    groupData.add_argument('--bag-freq', metavar='bag_freq', type=float, help='Frequency to extract features at [hz]')
+    groupData.add_argument('--perform-synchronization',  action='store_true', dest='perform_synchronization', \
+                          help='Perform a clock synchronization according to \'Clock synchronization algorithms for network measurements\' by Zhang et al. (2002).')
+    
+    #configuration files
+    groupCam = parser.add_argument_group('Camera system configuration')
+    groupCam.add_argument('--cams', dest='chain_yaml', help='Camera system configuration as yaml file', action=Once)
+    groupCam.add_argument('--recompute-camera-chain-extrinsics',  action='store_true', dest='recompute_chain_extrinsics', \
+                          help='Recompute the camera chain extrinsics. This option is exclusively recommended for debugging purposes in order to identify problems with the camera chain extrinsics.')
+    groupCam.add_argument('--reprojection-sigma', type=float, default=1.0, dest='reprojection_sigma', help='Standard deviation of the distribution of reprojected corner points [px]. (default: %(default)s)', required=False)
+    
+    groupTarget = parser.add_argument_group('Calibration target')
+    groupTarget.add_argument('--target', dest='target_yaml', help='Calibration target configuration as yaml file', required=True, action=Once)
+
+    #Result options  
+    outputSettings = parser.add_argument_group('Output options')
+    outputSettings.add_argument('--show-extraction', action='store_true', dest='showextraction', help='Show the calibration target extraction. (disables plots)')
+    outputSettings.add_argument('--extraction-stepping', action='store_true', dest='extractionstepping', help='Show each image during calibration target extraction  (disables plots)', required=False)
+    outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Verbose output (disables plots)')
+
+
+    #print help if no argument is specified
+    if len(sys.argv)==1:
+        parser.print_help()
+        sys.exit(2)
+    
+    #Parser the argument list
+    try:
+        parsed = parser.parse_args()
+    except:
+        sys.exit(2)
+                 
+    if parsed.verbose:
+        parsed.showextraction = True             
+    
+    #there is a with the gtk plot widget, so we cant plot if we have opencv windows open...
+    #--> disable the plots in these special situations
+    if parsed.showextraction or parsed.extractionstepping or parsed.verbose:
+        parsed.dontShowReport = True
+    
+    return parsed
+
+def main():
+    # Parse the arguments
+    parsed = parseArgs();
+    
+    #logging modess
+    if parsed.verbose:
+        sm.setLoggingLevel(sm.LoggingLevel.Debug)
+    else:
+        sm.setLoggingLevel(sm.LoggingLevel.Info)
+        
+    signal.signal(signal.SIGINT, signal_exit)
+
+    #load calibration target configuration 
+    targetConfig = kc.CalibrationTargetParameters(parsed.target_yaml)
+       
+    print("Initializing calibration target:")
+    targetConfig.printDetails()
+    
+    print("Initializing camera chain:")
+    chain = kc.CameraChainParameters(parsed.chain_yaml)      
+    chain.printDetails()   
+    camChain = sens.IccCameraChain(chain, targetConfig, parsed)
+    
+    for idx, cam in enumerate(camChain.camList):
+        out = open("pre_opt_poses_{0}.csv".format(idx), 'w')
+        print("#timestamp, p_RS_R_x [m], p_RS_R_y [m], p_RS_R_z [m], q_RS_w [], q_RS_x [], q_RS_y [], q_RS_z []", file=out)
+
+        print("Extracted {0} target observations".format(len(cam.targetObservations)))
+        for obs in cam.targetObservations:            
+            T_target_camera = sm.Transformation(obs.T_t_c().T())
+            position = T_target_camera.t()
+            orientation = T_target_camera.q()
+            print("{:.0f},".format(obs.time().toNSec()) + ",".join(map("{:.6f}".format, position)) \
+                + "," + ",".join(map("{:.6f}".format, orientation)) , file=out)
+if __name__ == "__main__":
+    main()
+
+        
