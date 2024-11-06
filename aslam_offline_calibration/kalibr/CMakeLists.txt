@@ -74,6 +74,7 @@ catkin_install_python(
     python/kalibr_camera_validator
     python/kalibr_visualize_calibration
     python/kalibr_calibrate_cameras
+    python/kalibr_extract_poses
     python/kalibr_visualize_distortion
     python/kalibr_calibrate_imu_camera
     python/kalibr_create_target_pdf
